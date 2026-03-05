@@ -1,4 +1,4 @@
-<h1>Universal Setup Script for Python Desktop Apps</h1>
+#Universal Setup Script for Python Desktop Apps
 
 If you want to use this tool for *all* your projects without copying `setup.py` into every single folder:
 
