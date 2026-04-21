@@ -7,7 +7,10 @@ Supports py2app (macOS) and PyInstaller (Cross-platform)
 via command line parameters.
 """
 
+from __future__ import annotations
+
 import sys
+import re
 import shutil
 import subprocess
 import ast
@@ -95,7 +98,6 @@ def analyze_actual_imports(source_dir, main_script=None):
 
     files_to_scan = list(source_path.rglob("*.py"))
 
-    # Fix #7: also scan main_script when it lives outside source_dir
     if main_script:
         main_path = Path(main_script).resolve()
         try:
@@ -118,7 +120,7 @@ def analyze_actual_imports(source_dir, main_script=None):
                     if node.module and node.level == 0:
                         imported_modules.add(node.module.split(".")[0])
                 elif isinstance(node, ast.Call):
-                    # Fix #1: capture string-literal dynamic imports:
+                    # Capture string-literal dynamic imports:
                     # __import__("pkg") and importlib.import_module("pkg")
                     func = node.func
                     is_builtin_import = (
@@ -228,7 +230,8 @@ def get_bundle_id(args):
     prefix = args.bundle_prefix
     if not prefix.endswith("."):
         prefix += "."
-    return prefix + args.app_name.lower().replace(" ", "-")
+    sanitized = re.sub(r"[^a-z0-9\-]", "-", args.app_name.lower())
+    return prefix + sanitized
 
 
 def get_package_name(args):
@@ -246,15 +249,20 @@ def read_requirements():
         req_path = base / "requirements.txt"
         if req_path.exists():
             lines = req_path.read_text(encoding="utf-8").splitlines()
-            return [
-                line.strip() for line in lines
-                if line.strip()
-                and not line.strip().startswith("#")
-                and not line.strip().startswith("-")   # -r, -c, -e, etc.
-                and not line.strip().startswith("git+")  # VCS URLs
-                and not line.strip().startswith("http://")   # direct URLs
-                and not line.strip().startswith("https://")  # direct URLs
-            ]
+            result = []
+            for line in lines:
+                line = line.split("#")[0].strip()
+                if not line:
+                    continue
+                if (
+                    line.startswith("-")
+                    or line.startswith("git+")
+                    or line.startswith("http://")
+                    or line.startswith("https://")
+                ):
+                    continue
+                result.append(line)
+            return result
     return []
 
 
@@ -287,9 +295,8 @@ def validate_build_inputs(args):
     """Validate that required files and directories exist."""
     errors = []
 
-    # Fix #6: reject path-traversal patterns using Path decomposition.
-    # len(parts) != 1 catches any embedded separator; ".." / "." catch
-    # the remaining traversal and self-referential edge cases.
+    # Reject path-traversal patterns: len(parts) != 1 catches embedded
+    # separators; ".." / "." catch traversal and self-referential cases.
     _parts = Path(args.app_name).parts
     if len(_parts) != 1 or _parts[0] in ("..", "."):
         errors.append(
@@ -528,7 +535,6 @@ def build_with_py2app(args, includes, excludes):
 
     print(f"Building {args.app_name} v{args.app_version} with py2app...")
 
-    # Fix #2: resolve actual package names instead of assuming folder name
     source_pkgs = find_source_packages(args.source_dir)
 
     options = {
@@ -590,9 +596,7 @@ def build_with_pyinstaller(args, includes, excludes):
         "--clean",
     ]
 
-    # Add data files if a 'resources' or 'assets' directory exists
-    # Fix #4: use resolved absolute path as source so this works regardless
-    # of the working directory from which the script is invoked.
+    # Use resolved absolute paths so --add-data works from any working directory.
     sep = ";" if sys.platform == "win32" else ":"
     for data_dir in ["resources", "assets", "data"]:
         data_path = Path(data_dir).resolve()
@@ -601,7 +605,7 @@ def build_with_pyinstaller(args, includes, excludes):
             print(f"  Including data directory: {data_dir}/")
 
     # Add icon
-    icon_path = find_icon()
+    icon_path = find_icon(prefer_icns=(sys.platform == "darwin"))
     if icon_path:
         cmd.extend(["--icon", icon_path])
         print(f"  Using icon: {icon_path}")
@@ -624,7 +628,7 @@ def build_with_pyinstaller(args, includes, excludes):
 
     try:
         subprocess.run(cmd, check=True, text=True)
-        ext = ".app" if sys.platform == "darwin" else ""
+        ext = {"darwin": ".app", "win32": ".exe"}.get(sys.platform, "")
         output_name = f"{args.app_name}{ext}"
         print(f"\nPyInstaller build complete: dist/{output_name}")
         return True
@@ -842,7 +846,6 @@ def main():
             setattr(args, _attr, _val.strip('"\''))
 
     # Validate flag combinations
-    # Fix #3: --py2app and --pyinstaller are mutually exclusive
     if args.py2app and args.pyinstaller:
         print("[Error] --py2app and --pyinstaller are mutually exclusive.")
         sys.exit(1)
@@ -851,6 +854,13 @@ def main():
         print(
             "[Error] --notarize-profile requires --codesign-identity.\n"
             "        Notarization needs a signed app bundle."
+        )
+        sys.exit(1)
+
+    if args.notarize_profile and args.codesign_identity == "-":
+        print(
+            "[Error] Ad-hoc signing ('-') cannot be notarized.\n"
+            "        Use a real Developer ID Application identity."
         )
         sys.exit(1)
 
@@ -897,7 +907,6 @@ def main():
         print("\n" + "=" * 60)
         print("DEPENDENCY ANALYSIS")
         print("=" * 60)
-        # Fix #7: pass main_script so imports outside source_dir are captured
         actual_imports = analyze_actual_imports(
             args.source_dir, main_script=args.main_script
         )
