@@ -7,7 +7,6 @@ Supports py2app (macOS) and PyInstaller (Cross-platform)
 via command line parameters.
 """
 
-import os
 import sys
 import shutil
 import subprocess
@@ -71,13 +70,20 @@ except AttributeError:
 # ==============================================================================
 # 1. ADVANCED DEPENDENCY ANALYZER
 # ==============================================================================
-def analyze_actual_imports(source_dir):
-    """Scan source code via AST to find explicitly imported modules."""
+def analyze_actual_imports(source_dir, main_script=None):
+    """Scan source code via AST to find explicitly imported modules.
+
+    Also scans main_script if it lives outside source_dir, and captures
+    string-literal dynamic imports (__import__("pkg") and
+    importlib.import_module("pkg")).  Non-literal dynamic imports trigger
+    a warning so the user can add them via --extra-includes.
+    """
     print(
         f"Analyzing source code in '{source_dir}'"
         " to optimize dependencies..."
     )
     imported_modules = set()
+    dynamic_import_files = []
 
     source_path = Path(source_dir)
     if not source_path.exists():
@@ -87,7 +93,18 @@ def analyze_actual_imports(source_dir):
         )
         return imported_modules
 
-    for filepath in source_path.rglob("*.py"):
+    files_to_scan = list(source_path.rglob("*.py"))
+
+    # Fix #7: also scan main_script when it lives outside source_dir
+    if main_script:
+        main_path = Path(main_script).resolve()
+        try:
+            main_path.relative_to(source_path.resolve())
+        except ValueError:
+            if main_path.is_file():
+                files_to_scan.append(main_path)
+
+    for filepath in files_to_scan:
         try:
             content = filepath.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(content, filename=str(filepath))
@@ -100,10 +117,42 @@ def analyze_actual_imports(source_dir):
                     # they reference local modules, not third-party.
                     if node.module and node.level == 0:
                         imported_modules.add(node.module.split(".")[0])
+                elif isinstance(node, ast.Call):
+                    # Fix #1: capture string-literal dynamic imports:
+                    # __import__("pkg") and importlib.import_module("pkg")
+                    func = node.func
+                    is_builtin_import = (
+                        isinstance(func, ast.Name)
+                        and func.id == "__import__"
+                    )
+                    is_importlib = (
+                        isinstance(func, ast.Attribute)
+                        and func.attr == "import_module"
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id == "importlib"
+                    )
+                    if is_builtin_import or is_importlib:
+                        if node.args and isinstance(
+                            node.args[0], ast.Constant
+                        ):
+                            imported_modules.add(
+                                str(node.args[0].value).split(".")[0]
+                            )
+                        else:
+                            dynamic_import_files.append(str(filepath))
         except SyntaxError:
             print(f"  Warning: Syntax error in {filepath}, skipping.")
         except Exception as e:
             print(f"  Warning: Could not parse {filepath}: {e}")
+
+    if dynamic_import_files:
+        unique_files = sorted(set(dynamic_import_files))
+        print(
+            "  Warning: Non-literal dynamic imports detected in "
+            f"{len(unique_files)} file(s) — these cannot be auto-detected.\n"
+            "  Use --extra-includes to add any missing packages manually:\n"
+            + "\n".join(f"    {f}" for f in unique_files)
+        )
 
     print(
         "Detected explicit imports: "
@@ -143,12 +192,43 @@ def get_third_party_includes(actual_imports, source_dir=None):
     return list(third_party)
 
 
+def find_source_packages(source_dir):
+    """Fix #2: find actual importable package names within source_dir.
+
+    A package is a directory containing __init__.py.  Falls back to the
+    directory name if no packages are found (with a warning).
+    """
+    source_path = Path(source_dir).resolve()
+    packages = []
+
+    # source_dir itself may be the package
+    if (source_path / "__init__.py").exists():
+        packages.append(source_path.name)
+    else:
+        # Look one level deep for sub-packages
+        for child in sorted(source_path.iterdir()):
+            if child.is_dir() and (child / "__init__.py").exists():
+                packages.append(child.name)
+
+    if not packages:
+        packages = [source_path.name]
+        print(
+            f"  Warning: No __init__.py found in '{source_dir}'."
+            f" Assuming package name is '{source_path.name}'."
+        )
+
+    return packages
+
+
 # ==============================================================================
 # 2. UTILITY FUNCTIONS
 # ==============================================================================
 def get_bundle_id(args):
     """Generate a macOS bundle identifier."""
-    return args.bundle_prefix + args.app_name.lower().replace(" ", "-")
+    prefix = args.bundle_prefix
+    if not prefix.endswith("."):
+        prefix += "."
+    return prefix + args.app_name.lower().replace(" ", "-")
 
 
 def get_package_name(args):
@@ -157,18 +237,24 @@ def get_package_name(args):
 
 
 def read_requirements():
-    """Read requirements.txt, skipping pip directives and URLs."""
-    req_path = Path("requirements.txt")
-    if req_path.exists():
-        lines = req_path.read_text(encoding="utf-8").splitlines()
-        return [
-            line.strip() for line in lines
-            if line.strip()
-            and not line.strip().startswith("#")
-            and not line.strip().startswith("-")   # -r, -c, -e, etc.
-            and not line.strip().startswith("git+")  # VCS URLs
-            and not line.strip().startswith("http")  # direct URLs
-        ]
+    """Read requirements.txt, skipping pip directives and URLs.
+
+    Fix #5: searches CWD first, then the directory containing this script,
+    so the script works correctly regardless of the invocation directory.
+    """
+    for base in (Path("."), Path(__file__).parent):
+        req_path = base / "requirements.txt"
+        if req_path.exists():
+            lines = req_path.read_text(encoding="utf-8").splitlines()
+            return [
+                line.strip() for line in lines
+                if line.strip()
+                and not line.strip().startswith("#")
+                and not line.strip().startswith("-")   # -r, -c, -e, etc.
+                and not line.strip().startswith("git+")  # VCS URLs
+                and not line.strip().startswith("http://")   # direct URLs
+                and not line.strip().startswith("https://")  # direct URLs
+            ]
     return []
 
 
@@ -201,8 +287,11 @@ def validate_build_inputs(args):
     """Validate that required files and directories exist."""
     errors = []
 
-    # Reject path-traversal characters to prevent unexpected file creation
-    if any(c in args.app_name for c in (os.sep, "/", "..")):
+    # Fix #6: reject path-traversal patterns using Path decomposition.
+    # len(parts) != 1 catches any embedded separator; ".." / "." catch
+    # the remaining traversal and self-referential edge cases.
+    _parts = Path(args.app_name).parts
+    if len(_parts) != 1 or _parts[0] in ("..", "."):
         errors.append(
             f"App name contains invalid path characters: '{args.app_name}'"
         )
@@ -228,8 +317,11 @@ def clean_build():
     for dir_name in ["build", "dist"]:
         dir_path = Path(dir_name)
         if dir_path.is_dir():
-            shutil.rmtree(dir_path, ignore_errors=True)
-            print(f"  Removed: {dir_name}/")
+            try:
+                shutil.rmtree(dir_path)
+                print(f"  Removed: {dir_name}/")
+            except OSError as e:
+                print(f"  Warning: Could not fully remove {dir_name}/: {e}")
 
     # Recursively remove __pycache__ and egg-info
     removed_count = 0
@@ -294,6 +386,19 @@ def create_dmg(args):
             text=True
         )
         print("DMG created successfully.")
+
+        identity = args.codesign_identity
+        if identity:
+            print(f"  Signing DMG with identity: {identity}")
+            try:
+                subprocess.run(
+                    ["codesign", "--force", "--sign", identity, str(dmg_path)],
+                    check=True, capture_output=True, text=True
+                )
+                print("  DMG signed successfully.")
+            except subprocess.CalledProcessError as sign_err:
+                print(f"  DMG signing failed: {sign_err.stderr}")
+
         return True
 
     except subprocess.CalledProcessError as e:
@@ -306,7 +411,114 @@ def create_dmg(args):
 
 
 # ==============================================================================
-# 3. BUILDERS
+# 3. CODE SIGNING & NOTARIZATION
+# ==============================================================================
+def generate_entitlements(custom_path=None):
+    """
+    Return the path to an entitlements plist.
+    If no custom path is given, generate a default one for Python/Qt apps.
+    """
+    if custom_path:
+        return custom_path
+
+    target = Path("entitlements.plist")
+    if not target.exists():
+        target.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n'
+            '  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n'
+            '<dict>\n'
+            '    <!-- Required for Python dynamic code execution -->\n'
+            '    <key>com.apple.security.cs.allow-jit</key>\n'
+            '    <true/>\n'
+            '    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>\n'
+            '    <true/>\n'
+            '    <!-- Required to load bundled .so/.dylib files -->\n'
+            '    <key>com.apple.security.cs.disable-library-validation</key>\n'
+            '    <true/>\n'
+            '</dict>\n'
+            '</plist>\n',
+            encoding="utf-8"
+        )
+        print(f"  Generated entitlements: {target}")
+    return str(target)
+
+
+def codesign_app(app_path, identity, entitlements_path):
+    """
+    Sign a .app bundle with hardened runtime enabled.
+    Uses --deep so all bundled frameworks and .so files are signed recursively.
+    Hardened runtime + a real Developer ID is required for notarization.
+
+    Note: Apple recommends signing inner binaries individually before the
+    outer bundle.  --deep is a pragmatic shortcut for Python apps but may
+    miss nested bundles or apply incorrect entitlements to inner frameworks.
+    """
+    app = Path(app_path)
+    if not app.exists():
+        print(f"Error: app bundle not found: {app}")
+        return False
+
+    print(f"Code-signing {app.name} with identity: {identity}")
+    cmd = [
+        "codesign",
+        "--deep", "--force", "--verify", "--verbose",
+        "--sign", identity,
+        "--options", "runtime",
+        "--entitlements", entitlements_path,
+        str(app),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print("  Signed successfully.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  Code signing failed:\n{e.stderr}")
+        return False
+
+
+def notarize_app(app_path, profile):
+    """
+    Submit a .app to Apple's notarization service and staple the ticket.
+
+    Requires a keychain profile created beforehand with:
+      xcrun notarytool store-credentials <profile-name> \\
+          --apple-id your@email.com --team-id TEAMID
+    """
+    app = Path(app_path)
+    zip_path = app.parent / f"{app.stem}-notarize.zip"
+    print(f"Notarizing {app.name} (this may take a few minutes)...")
+
+    try:
+        subprocess.run(
+            ["ditto", "-c", "-k", "--keepParent", str(app), str(zip_path)],
+            check=True, capture_output=True, text=True
+        )
+        result = subprocess.run(
+            [
+                "xcrun", "notarytool", "submit", str(zip_path),
+                "--keychain-profile", profile,
+                "--wait",
+            ],
+            check=True, capture_output=True, text=True
+        )
+        print(result.stdout)
+        subprocess.run(
+            ["xcrun", "stapler", "staple", str(app)],
+            check=True, capture_output=True, text=True
+        )
+        print("  Notarized and stapled successfully.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  Notarization failed:\n{e.stdout}\n{e.stderr}")
+        return False
+    finally:
+        zip_path.unlink(missing_ok=True)
+
+
+# ==============================================================================
+# 4. BUILDERS
 # ==============================================================================
 def build_with_py2app(args, includes, excludes):
     """Build a macOS .app bundle using py2app."""
@@ -316,8 +528,8 @@ def build_with_py2app(args, includes, excludes):
 
     print(f"Building {args.app_name} v{args.app_version} with py2app...")
 
-    # py2app 'packages' expects Python package names, not filesystem paths
-    source_pkg = Path(args.source_dir).name
+    # Fix #2: resolve actual package names instead of assuming folder name
+    source_pkgs = find_source_packages(args.source_dir)
 
     options = {
         "argv_emulation": False,
@@ -332,7 +544,7 @@ def build_with_py2app(args, includes, excludes):
         },
         "includes": includes,
         "excludes": excludes,
-        "packages": [source_pkg],
+        "packages": source_pkgs,
     }
 
     icon_path = find_icon(prefer_icns=True)
@@ -378,14 +590,14 @@ def build_with_pyinstaller(args, includes, excludes):
         "--clean",
     ]
 
-    # Add source directory as a package path for proper importing
-    cmd.extend(["--paths", args.source_dir])
-
     # Add data files if a 'resources' or 'assets' directory exists
+    # Fix #4: use resolved absolute path as source so this works regardless
+    # of the working directory from which the script is invoked.
     sep = ";" if sys.platform == "win32" else ":"
     for data_dir in ["resources", "assets", "data"]:
-        if Path(data_dir).is_dir():
-            cmd.extend(["--add-data", f"{data_dir}{sep}{data_dir}"])
+        data_path = Path(data_dir).resolve()
+        if data_path.is_dir():
+            cmd.extend(["--add-data", f"{data_path}{sep}{data_dir}"])
             print(f"  Including data directory: {data_dir}/")
 
     # Add icon
@@ -432,7 +644,7 @@ def build_with_pyinstaller(args, includes, excludes):
 
 
 # ==============================================================================
-# 4. ARGUMENT PARSER
+# 5. ARGUMENT PARSER
 # ==============================================================================
 def create_parser():
     """Creates and configures the argument parser."""
@@ -442,9 +654,11 @@ Examples:
      python setup.py --app-name "My App" --main-script run.py \\
          --source-dir my_src --pyinstaller
 
-  2. Build with py2app and package into a DMG (macOS only):
+  2. Build with py2app, sign, notarize, and package into a DMG (macOS only):
      python setup.py --app-name "My App" --main-script run.py \\
-         --source-dir my_src --py2app --dmg
+         --source-dir my_src --py2app --dmg \\
+         --codesign-identity "Developer ID Application: Name (TEAMID)" \\
+         --notarize-profile "my-notarytool-profile"
 
   3. Clean previous builds and compile with a custom version:
      python setup.py --clean --app-name "Dashboard" \\
@@ -521,6 +735,39 @@ Examples:
         help="Modules to exclude (wins over --extra-includes)"
     )
 
+    group_sign = parser.add_argument_group(
+        "Code Signing & Notarization (macOS only)"
+    )
+    group_sign.add_argument(
+        "--codesign-identity",
+        type=str,
+        default=None,
+        help=(
+            'Code-signing identity, e.g. "Developer ID Application: Name (TEAMID)". '
+            'Use "-" for ad-hoc signing (prevents App Translocation on the same machine '
+            'but cannot be notarized and will still be blocked on other Macs).'
+        )
+    )
+    group_sign.add_argument(
+        "--notarize-profile",
+        type=str,
+        default=None,
+        help=(
+            "Keychain profile name for Apple notarization. "
+            "Create one with: xcrun notarytool store-credentials <profile-name>. "
+            "Requires --codesign-identity with a real Developer ID (not ad-hoc)."
+        )
+    )
+    group_sign.add_argument(
+        "--entitlements",
+        type=str,
+        default=None,
+        help=(
+            "Path to a custom entitlements .plist file. "
+            "If omitted, a default Python/Qt entitlements file is generated automatically."
+        )
+    )
+
     group_build = parser.add_argument_group("Build Actions")
     group_build.add_argument(
         "--clean",
@@ -547,7 +794,7 @@ Examples:
 
 
 # ==============================================================================
-# 5. TYPED ARGUMENT NAMESPACE
+# 6. TYPED ARGUMENT NAMESPACE
 # ==============================================================================
 class Args(argparse.Namespace):
     """Typed namespace for parsed CLI arguments."""
@@ -559,8 +806,11 @@ class Args(argparse.Namespace):
     author: str
     bundle_prefix: str
     min_macos: str
-    extra_includes: list
-    extra_excludes: list
+    extra_includes: list[str]
+    extra_excludes: list[str]
+    codesign_identity: str | None
+    notarize_profile: str | None
+    entitlements: str | None
     clean: bool
     dmg: bool
     py2app: bool
@@ -581,7 +831,9 @@ def main():
 
     # Parse arguments (ignoring unknown ones for setuptools compatibility)
     args = Args()
-    parser.parse_known_args(namespace=args)
+    _, unknown = parser.parse_known_args(namespace=args)
+    if unknown:
+        print(f"[Warning] Ignoring unknown arguments: {' '.join(unknown)}")
 
     # Strip stray surrounding quotes that some shells/IDEs inject
     for _attr in ("app_name", "main_script", "source_dir"):
@@ -589,8 +841,27 @@ def main():
         if isinstance(_val, str):
             setattr(args, _attr, _val.strip('"\''))
 
+    # Validate flag combinations
+    # Fix #3: --py2app and --pyinstaller are mutually exclusive
+    if args.py2app and args.pyinstaller:
+        print("[Error] --py2app and --pyinstaller are mutually exclusive.")
+        sys.exit(1)
+
+    if args.notarize_profile and not args.codesign_identity:
+        print(
+            "[Error] --notarize-profile requires --codesign-identity.\n"
+            "        Notarization needs a signed app bundle."
+        )
+        sys.exit(1)
+
     # Determine if we are running a build command
     is_building = args.py2app or args.pyinstaller
+
+    if args.dmg and not is_building:
+        print(
+            "[Warning] --dmg has no effect without"
+            " --py2app or --pyinstaller."
+        )
 
     # Handle clean-only operation
     if args.clean:
@@ -626,7 +897,10 @@ def main():
         print("\n" + "=" * 60)
         print("DEPENDENCY ANALYSIS")
         print("=" * 60)
-        actual_imports = analyze_actual_imports(args.source_dir)
+        # Fix #7: pass main_script so imports outside source_dir are captured
+        actual_imports = analyze_actual_imports(
+            args.source_dir, main_script=args.main_script
+        )
         auto_excludes = get_optimized_excludes(actual_imports)
         auto_includes = get_third_party_includes(
             actual_imports, args.source_dir
@@ -666,7 +940,30 @@ def main():
         elif args.pyinstaller:
             success = build_with_pyinstaller(args, includes, excludes)
 
-        # Step C: Package DMG
+        # Step C: Code Signing
+        if success and sys.platform == "darwin" and args.codesign_identity:
+            print("\n" + "=" * 60)
+            print("CODE SIGNING")
+            print("=" * 60)
+            app_path = f"dist/{args.app_name}.app"
+            entitlements_path = generate_entitlements(args.entitlements)
+            success = codesign_app(app_path, args.codesign_identity, entitlements_path)
+
+            # Step D: Notarization (only if signing succeeded and profile given)
+            if success and args.notarize_profile:
+                print("\n" + "=" * 60)
+                print("NOTARIZATION")
+                print("=" * 60)
+                success = notarize_app(app_path, args.notarize_profile)
+        elif success and sys.platform == "darwin" and not args.codesign_identity:
+            print(
+                "\n[Warning] No --codesign-identity provided. "
+                "The app will not be signed or notarized.\n"
+                "         macOS Gatekeeper may block or translocate it on other machines.\n"
+                "         Pass --codesign-identity to fix this."
+            )
+
+        # Step E: Package DMG
         if success and args.dmg:
             print("\n" + "=" * 60)
             print("PACKAGING PHASE")
