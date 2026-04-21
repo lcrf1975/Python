@@ -62,7 +62,7 @@ Run without arguments to print the full help message.
 
 | Flag | Description |
 |------|-------------|
-| `--codesign-identity ID` | Signing identity, e.g. `"Developer ID Application: Name (TEAMID)"`. Use `"-"` for ad-hoc signing (local use only, cannot be notarized). |
+| `--codesign-identity ID` | Signing identity, e.g. `"Developer ID Application: Name (TEAMID)"`. Use `"-"` for ad-hoc signing — bypasses macOS App Translocation and Gatekeeper quarantine on your own machine without requiring a paid Developer ID. Not distributable to other Macs and cannot be notarized. |
 | `--notarize-profile NAME` | Keychain profile for `xcrun notarytool`. Requires a real Developer ID (not ad-hoc). |
 | `--entitlements FILE` | Path to a custom `.plist` entitlements file. If omitted, a default file for Python/Qt apps is generated automatically. |
 
@@ -74,7 +74,14 @@ python setup.py --app-name "My App" --main-script run.py \
     --source-dir my_src --pyinstaller
 ```
 
-**2. py2app build with signing, notarization, and DMG (macOS):**
+**2. Ad-hoc signing — bypass Gatekeeper on your own Mac (no Developer ID needed):**
+```bash
+python setup.py --app-name "My App" --main-script run.py \
+    --source-dir my_src --pyinstaller \
+    --codesign-identity "-"
+```
+
+**3. py2app build with full signing, notarization, and DMG (macOS distribution):**
 ```bash
 python setup.py --app-name "My App" --main-script run.py \
     --source-dir my_src --py2app --dmg \
@@ -82,19 +89,19 @@ python setup.py --app-name "My App" --main-script run.py \
     --notarize-profile "my-notarytool-profile"
 ```
 
-**3. Clean then build with a custom version:**
+**4. Clean then build with a custom version:**
 ```bash
 python setup.py --clean --app-name "Dashboard" \
     --main-script app.py --source-dir src \
     --app-version 2.1.0 --pyinstaller
 ```
 
-**4. Clean only:**
+**5. Clean only:**
 ```bash
 python setup.py --clean
 ```
 
-**5. Force-include a package missed by auto-detection:**
+**6. Force-include a package missed by auto-detection:**
 ```bash
 python setup.py --app-name "My App" --main-script run.py \
     --source-dir src --pyinstaller \
