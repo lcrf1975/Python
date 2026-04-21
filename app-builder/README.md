@@ -81,6 +81,11 @@ python setup.py --app-name "My App" --main-script run.py \
     --codesign-identity "-"
 ```
 
+> If macOS still blocks the app after copying (e.g. from a DMG), remove the quarantine attribute:
+> ```bash
+> xattr -cr /Applications/My\ App.app
+> ```
+
 **3. py2app build with full signing, notarization, and DMG (macOS distribution):**
 ```bash
 python setup.py --app-name "My App" --main-script run.py \
